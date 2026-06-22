@@ -87,6 +87,15 @@ class MainActivity : AppCompatActivity() {
                         " ul=${q.ul} lr=${q.lr}")
             }
 
+            // 保存渲染 bitmap 到 PNG 供 Plan 3 视觉验证
+            try {
+                val outPng = File(getExternalFilesDir(null), "render_test_pdf_p0.png")
+                outPng.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                Log.i(TAG, "Saved render: ${outPng.absolutePath}")
+            } catch (e: Exception) {
+                Log.e(TAG, "save bmp failed", e)
+            }
+
             PdfiumCore.nativeCloseDocument(doc)
 
             runOnUiThread {
