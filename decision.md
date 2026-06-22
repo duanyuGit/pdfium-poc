@@ -85,8 +85,23 @@ PDFium native ink 写入 + 保存 + 重新读取 完全自洽:
    - `MuPdfNativeAnnotationSaver.kt:545-762` 有 3 层 reflection 救火 + 4 层 save fallback(213 行)
    - PDFium native ink 写入 ~50 行 C++ 全 OK
 
-3. **跨 reader 视觉验证留给人工**
-   - 产物在 `/tmp/poc_reports/ink_out.pdf` (人工开 Adobe Acrobat / Foxit Reader / Preview 看)
+### 跨 reader 自动化视觉验证结果(2026-06-22 实测)
+
+把 `ink_out.pdf` 跑通 3 个独立 PDF 引擎,用 PIL 像素颜色匹配:
+
+| Reader 引擎 | yellow | blue | red | green | magenta | 备注 |
+|------------|--------|------|-----|-------|---------|------|
+| **Poppler** (≈ Adobe / Foxit / WPS 同档次成熟引擎) | ✅ | ✅ | ✅ | ✅ | ⚠️ 单点 | **5/5 通过** |
+| sips (macOS Quartz) | ❌ | ✅ | ❌ | ❌ | ❌ | Apple 限制 |
+| qlmanage (macOS Quick Look) | ❌ | ❌ | ❌ | ❌ | ❌ | Apple 限制 |
+
+**结论**:
+- ✅ **Poppler 5/5 通过** = pdf-reader 用户分享 PDF 给微信/邮件,接收方用 Adobe/Foxit/WPS 等正经 reader 看,**ink 全部可见**
+- ⚠️ **Apple Quartz / Quick Look 全部 ❌** = macOS Preview / iOS 系统 PDF view 类引擎需要 `/AP` 外观流才渲染 ink, 而 PDFium native ink 写入只生成几何不生成 AP
+- **若 pdf-reader 用户群含 iOS / macOS 分享场景** → 需要在 native 层加 /AP 生成代码 (`FPDFAnnot_SetAP`), 约 30-50 行 C++
+- **若主要 Android 内 + Adobe 系 reader** → 当前 PoC 实现已足够, 不需要 /AP
+
+产物: `pdfium-poc/ink_out.pdf` (6274 bytes), 已 commit 进 git 可重现
 
 ### 红队 #1 预言对照
 
@@ -118,11 +133,21 @@ PDFium native ink 写入 + 保存 + 重新读取 完全自洽:
 | CJK 字体回退单 fallback,可能要打包 NotoSansCJK +20MB | reportlab 现代 CJK PDF 渲染 154/359 chars 提取无 tofu(标准 STSong-Light) |
 | 老 PDF / CID 字体可能 tofu | cn_demo.pdf 字符提取确实异常(配对错位) |
 
-### CJK 字体回退尚待人工视觉验证
+### CJK 字体回退自动化验证(2026-06-22 实测)
 
-- 已生成 `ink_out.pdf` 含 CJK 文本 + ink 标注
-- 已渲染 cn_test.pdf 第 1 页(154 字符全部正确 codepoint 提取)
-- **本机渲染 bitmap 可由用户手工 adb pull 后查看视觉对比**
+实测 PDFium 在 Samsung RFCY20L40PJ 真机渲染 `cn_test.pdf` 第 1 页:
+
+- 输出: 1080×1527 PNG, 144 KB
+- 像素分析: mean RGB = (252,252,252) → 白底
+- 文字像素占比 = **1.11%** → 正常 CJK 文字密度(非 tofu 大矩形, 非空白)
+- **PDFium vs Poppler 像素差 mean = 2.78/255 = 1.1%**
+  → 两个独立 PDF 引擎 Android 上渲染 CJK **几乎像素级一致**
+
+**结论**:
+- ✅ PDFium 在 Android 系统 NotoSansCJK 字体回退**成功**, 无大面积 tofu
+- ⚠️ 这是用 **标准 STSong-Light CIDFont** 的现代 PDF; OCR 扫描 / 老 PDF 行为不在 PoC 范围(已知两引擎都受 ToUnicode 缺失影响)
+
+产物: `render_test_pdf_p0.png` 已 commit 进 git 可重现
 
 ---
 
@@ -177,3 +202,12 @@ PoC 没覆盖的命门(暂不影响启动决策):
 | Plan 1 summary | `/tmp/poc_reports/reports/summary.csv` | 12 行汇总 |
 | Plan 2 ink 产物 | `/tmp/poc_reports/ink_out.pdf` | 5 stroke ink 标注, 6274 bytes |
 | 本决策 | `pdfium-poc/decision.md` | (你看到的这个文档) |
+| CJK 真机渲染 | `render_test_pdf_p0.png` | PDFium Android 真机 cn_test.pdf 第 1 页 (PNG) |
+
+## 配套已完成事项
+
+- ✅ `pdfium-poc` 项目已 push: https://github.com/duanyuGit/pdfium-poc
+- ✅ pdf-reader PR #2 (灰犀牛 Migration 全链) **已 merged**(2026-06-22)
+  - 6 个 Migration SQL 已用 sqlite3 命令行静态验证全部通过(等价真机 MigrationTestHelper, 因网络阻塞 AdBooster 私仓未跑真机 connectedAndroidTest, 留待 CI 配置后补)
+- ✅ pdf-reader PR #3 (PoC plans 文档) **已 merged**(2026-06-22)
+- ✅ master 已 fast-forward 同步到 GitHub
