@@ -1,0 +1,13 @@
+*.iml
+.gradle/
+.idea/
+.DS_Store
+build/
+.cxx/
+local.properties
+captures/
+
+# 不上传 bblanchon 预编译, build 时本地解压
+# (避免大文件污染 git, 用 README 说明如何下载)
+/app/src/main/cpp/pdfium/
+/app/src/main/jniLibs/
