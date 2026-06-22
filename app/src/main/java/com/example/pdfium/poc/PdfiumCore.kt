@@ -43,6 +43,25 @@ object PdfiumCore {
 
     // ---------- Plan 1: CJK char-level quad ----------
 
+    // ---------- Plan 2: Ink round-trip ----------
+
+    /**
+     * 写 Ink 标注 (PDFium native FPDFAnnot_AddInkStroke + SetBorder)
+     * @param points [x0,y0, x1,y1, ...] PDF 坐标 Y 朝上
+     * @param colorArgb 0xAARRGGBB
+     * @param strokeWidth in PDF pt (必填, 否则不可见)
+     */
+    external fun nativeAddInk(
+        docPtr: Long, pageIndex: Int,
+        points: FloatArray, colorArgb: Int, strokeWidth: Float
+    ): Boolean
+
+    /** 探测某页 annotation 元数据, 返回结构化字符串 */
+    external fun nativeInspectAnnotations(docPtr: Long, pageIndex: Int): String
+
+    /** FPDF_SaveAsCopy 保存到指定路径 (flag=0 全量保存) */
+    external fun nativeSaveAsCopy(docPtr: Long, outPath: String): Boolean
+
     /**
      * 提取一页所有字符的 quad 4 角点 + codepoint。
      *

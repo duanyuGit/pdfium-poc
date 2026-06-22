@@ -125,7 +125,11 @@ class CjkQuadComparator(
         val maxDiffPt: Double,
         val misalignCount: Int,  // 偏移 > 10pt 视为完全错位
         val misalignRate: Double,
-        val perPdfMaxDiff: Double
+        val perPdfMaxDiff: Double,
+        val avgDiffXPt: Double,  // 仅 X 方向 (决定选词左右边界, 用户感知关键维度)
+        val maxDiffXPt: Double,
+        val avgDiffYPt: Double,  // 仅 Y 方向 (行高定义差异, 影响小)
+        val maxDiffYPt: Double
     )
 
     /**
@@ -149,14 +153,18 @@ class CjkQuadComparator(
         val pageDimsForLog = pageDims
 
         FileWriter(outCsvPath).use { csv ->
-            csv.write("page,codepoint,char,occurrence,mupdf_ulX,mupdf_ulY,pdfium_ulX,pdfium_ulY,ul_diff_pt,ur_diff_pt,ll_diff_pt,lr_diff_pt,max_diff_pt,max_diff_px\n")
+            csv.write("page,codepoint,char,occurrence,mupdf_ulX,mupdf_ulY,pdfium_ulX,pdfium_ulY," +
+                    "ul_diff_pt,max_diff_pt,max_diff_px,diffX_pt,diffY_pt\n")
 
             var totalPairs = 0
             var sumDiffPt = 0.0
             var maxDiffPt = 0.0
+            var sumDiffX = 0.0
+            var maxDiffX = 0.0
+            var sumDiffY = 0.0
+            var maxDiffY = 0.0
             var misalignCount = 0
 
-            // 联合所有 key
             val allKeys = (mupdfBuckets.keys + pdfiumBuckets.keys).distinct()
             for (key in allKeys) {
                 val mList = mupdfBuckets[key].orEmpty()
@@ -172,16 +180,29 @@ class CjkQuadComparator(
                     val maxQuadDiff = max(max(ulD, urD), max(llD, lrD))
                     val maxQuadDiffPx = maxQuadDiff * pointToPxScale
 
+                    // 分维度统计: X 方向(决定选词左右边界)+ Y 方向(行高定义)
+                    val maxDiffXThis = maxOf(
+                        abs(m.ulX - p.ulX), abs(m.urX - p.urX),
+                        abs(m.llX - p.llX), abs(m.lrX - p.lrX)
+                    ).toDouble()
+                    val maxDiffYThis = maxOf(
+                        abs(m.ulY - p.ulY), abs(m.urY - p.urY),
+                        abs(m.llY - p.llY), abs(m.lrY - p.lrY)
+                    ).toDouble()
+
                     totalPairs++
                     sumDiffPt += maxQuadDiff
                     if (maxQuadDiff > maxDiffPt) maxDiffPt = maxQuadDiff
+                    sumDiffX += maxDiffXThis
+                    if (maxDiffXThis > maxDiffX) maxDiffX = maxDiffXThis
+                    sumDiffY += maxDiffYThis
+                    if (maxDiffYThis > maxDiffY) maxDiffY = maxDiffYThis
                     if (maxQuadDiff > ptMisalignThreshold) misalignCount++
 
                     csv.write("${m.page},${m.codepoint},${escapeCsv(m.text)},$i," +
                             "${m.ulX},${m.ulY},${p.ulX},${p.ulY}," +
-                            "$ulD,$urD,$llD,$lrD,$maxQuadDiff,$maxQuadDiffPx\n")
+                            "$ulD,$maxQuadDiff,$maxQuadDiffPx,$maxDiffXThis,$maxDiffYThis\n")
                 }
-                // 记录未配对(粒度不同)
                 if (mList.size != pList.size) {
                     Log.w(TAG, "Pairing mismatch: codepoint=0x${Integer.toHexString(key.second)} '${
                         String(Character.toChars(key.second))}' mupdf=${mList.size} pdfium=${pList.size}")
@@ -195,7 +216,11 @@ class CjkQuadComparator(
                 maxDiffPt = maxDiffPt,
                 misalignCount = misalignCount,
                 misalignRate = if (totalPairs > 0) misalignCount.toDouble() / totalPairs else 0.0,
-                perPdfMaxDiff = maxDiffPt
+                perPdfMaxDiff = maxDiffPt,
+                avgDiffXPt = if (totalPairs > 0) sumDiffX / totalPairs else 0.0,
+                maxDiffXPt = maxDiffX,
+                avgDiffYPt = if (totalPairs > 0) sumDiffY / totalPairs else 0.0,
+                maxDiffYPt = maxDiffY
             )
         }
     }
@@ -229,16 +254,21 @@ class CjkQuadComparator(
                     }
                 }
 
-            // 写汇总
+            // 写汇总(含 X/Y 分维度)
             File(outputDir, "summary.csv").writeText(buildString {
-                append("pdf_name,total_pairs,avg_diff_pt,max_diff_pt,misalign_count,misalign_rate,verdict\n")
+                append("pdf_name,pairs,avg_diff_pt,max_diff_pt,avg_X,max_X,avg_Y,max_Y,misalign_count,misalign_rate,verdict_x_only\n")
                 results.forEach { (name, r) ->
-                    val verdict = when {
-                        r.avgDiffPt <= 0.5 && r.misalignCount == 0 -> "GREEN"
-                        r.avgDiffPt <= 1.5 && r.misalignRate < 0.01 -> "YELLOW"
+                    // 用户感知最关键的是 X 方向 (决定选词左右边界)
+                    // Y 方向偏移是行高定义差异, MuPDF 用 ascender/descender, PDFium 用 actual glyph
+                    // 这种 Y 偏移在 pdf-reader 适配层可以统一处理(用 PDFium GetCharOrigin + GetFontSize 推 ascent/descent)
+                    val verdictX = when {
+                        r.avgDiffXPt <= 0.5 && r.maxDiffXPt <= 3.0 -> "GREEN"
+                        r.avgDiffXPt <= 1.5 && r.maxDiffXPt <= 10.0 -> "YELLOW"
                         else -> "RED"
                     }
-                    append("$name,${r.totalPairs},${r.avgDiffPt},${r.maxDiffPt},${r.misalignCount},${r.misalignRate},$verdict\n")
+                    append("$name,${r.totalPairs},${r.avgDiffPt},${r.maxDiffPt}," +
+                            "${r.avgDiffXPt},${r.maxDiffXPt},${r.avgDiffYPt},${r.maxDiffYPt}," +
+                            "${r.misalignCount},${r.misalignRate},$verdictX\n")
                 }
             })
             return results

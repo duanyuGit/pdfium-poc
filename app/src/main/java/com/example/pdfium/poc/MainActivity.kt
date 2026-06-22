@@ -42,10 +42,15 @@ class MainActivity : AppCompatActivity() {
             text = "Run CJK Quad Comparison (Plan 1)"
             setOnClickListener { runCjkComparison() }
         }
+        val runInkRoundTripBtn = Button(this).apply {
+            text = "Run Ink Round-Trip (Plan 2)"
+            setOnClickListener { runInkRoundTrip() }
+        }
         imageView = ImageView(this)
         val scroll = ScrollView(this).apply { addView(imageView) }
         root.addView(statusText)
         root.addView(runComparisonBtn)
+        root.addView(runInkRoundTripBtn)
         root.addView(scroll)
         setContentView(root)
 
@@ -92,6 +97,34 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
+    private fun runInkRoundTrip() {
+        val src = File(getExternalFilesDir(null), "test_pdfs/cn_test.pdf")
+        if (!src.exists()) {
+            statusText.text = "缺源 PDF (cn_test.pdf), 先跑 Plan 1 推过去"
+            return
+        }
+        val out = File(getExternalFilesDir(null), "ink_out.pdf")
+        statusText.text = "Plan 2 Ink round-trip 运行中..."
+        Thread {
+            try {
+                val v = InkRoundTripTester(src, out).run()
+                val msg = buildString {
+                    val emoji = if (v.pass) "🟢" else "🔴"
+                    append("$emoji Plan 2 Ink Round-Trip: pass=${v.pass}\n")
+                    append("写入 5 stroke → 重读: annotCount=${v.annotCount}, inkAnnotCount=${v.inkAnnotCount}\n\n")
+                    append("Inspection 全文:\n${v.inspectionResult}\n\n")
+                    append("产物: ${out.absolutePath}\n")
+                    append("用 adb pull 拿到本地, 用 Adobe Acrobat / Foxit 打开验证视觉是否可见 + 跨 reader 兼容")
+                }
+                Log.i(TAG, msg)
+                runOnUiThread { statusText.text = msg }
+            } catch (e: Exception) {
+                Log.e(TAG, "Plan 2 failed", e)
+                runOnUiThread { statusText.text = "失败: ${e.message}" }
+            }
+        }.start()
+    }
+
     private fun runCjkComparison() {
         val testDir = File(getExternalFilesDir(null), "test_pdfs")
         if (!testDir.exists() || (testDir.listFiles()?.size ?: 0) == 0) {
@@ -108,13 +141,14 @@ class MainActivity : AppCompatActivity() {
                     append("✓ Plan 1 完成, ${results.size} 份 PDF\n")
                     append("详细 CSV: ${outDir.absolutePath}/\n\n")
                     results.forEach { (name, r) ->
+                        // X-only verdict: 用户感知最关键的维度
                         val verdict = when {
-                            r.avgDiffPt <= 0.5 && r.misalignCount == 0 -> "🟢"
-                            r.avgDiffPt <= 1.5 && r.misalignRate < 0.01 -> "🟡"
+                            r.avgDiffXPt <= 0.5 && r.maxDiffXPt <= 3.0 -> "🟢"
+                            r.avgDiffXPt <= 1.5 && r.maxDiffXPt <= 10.0 -> "🟡"
                             else -> "🔴"
                         }
-                        append("$verdict $name: avg=${"%.2f".format(r.avgDiffPt)}pt " +
-                                "max=${"%.2f".format(r.maxDiffPt)}pt mis=${r.misalignCount}/${r.totalPairs}\n")
+                        append("$verdict $name: X=${"%.2f".format(r.avgDiffXPt)}/${"%.2f".format(r.maxDiffXPt)}pt " +
+                                "Y=${"%.2f".format(r.avgDiffYPt)}/${"%.2f".format(r.maxDiffYPt)}pt\n")
                     }
                 }
                 Log.i(TAG, summary)

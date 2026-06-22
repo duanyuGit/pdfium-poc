@@ -11,6 +11,9 @@
 #include <vector>
 #include "fpdfview.h"
 #include "fpdf_text.h"
+#include "fpdf_annot.h"
+#include "fpdf_edit.h"
+#include "fpdf_save.h"
 
 #define LOG_TAG "PdfPoc"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -131,34 +134,17 @@ Java_com_example_pdfium_poc_PdfiumCore_nativeGetPageCharQuads(
         double l, r, b, t;
         if (!FPDFText_GetCharBox(tp, i, &l, &r, &b, &t)) continue;
 
-        // 尝试取 matrix
-        FS_MATRIX m = {1, 0, 0, 1, 0, 0};
-        bool hasMatrix = FPDFText_GetMatrix(tp, i, &m);
-
-        float ulX, ulY, urX, urY, llX, llY, lrX, lrY;
-
-        if (hasMatrix) {
-            // matrix 策略: unit box [0,0]-[1,1] 经 matrix 变换得到 quad
-            // PDF matrix: [a b 0; c d 0; e f 1]: point (x,y) → (a*x + c*y + e, b*x + d*y + f)
-            // unit box: (0,0)=LL, (1,0)=LR, (0,1)=UL, (1,1)=UR
-            auto apply = [&m](float x, float y) -> std::pair<float, float> {
-                return {m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f};
-            };
-            auto ll = apply(0, 0);
-            auto lr = apply(1, 0);
-            auto ul = apply(0, 1);
-            auto ur = apply(1, 1);
-            ulX = ul.first;  ulY = ul.second;
-            urX = ur.first;  urY = ur.second;
-            llX = ll.first;  llY = ll.second;
-            lrX = lr.first;  lrY = lr.second;
-        } else {
-            // AABB 策略: 直接用 GetCharBox 边界
-            ulX = (float)l; ulY = (float)t;
-            urX = (float)r; urY = (float)t;
-            llX = (float)l; llY = (float)b;
-            lrX = (float)r; lrY = (float)b;
-        }
+        // GetCharBox 已经返回 PDF user space 的 AABB (l, r, b, t),
+        // 是字符的实际位置 + 大小。直接当 4 corner 用。
+        //
+        // 之前尝试用 FPDFText_GetMatrix + unit box [0,1]×[0,1] 变换 — 这是错的。
+        // GetMatrix 返回 char glyph 的 font transform, 不是 unit box → 字符位置的映射。
+        // 旋转字符场景 GetCharBox AABB 会比真实 glyph 包络偏大, 但平面 ASCII / CJK
+        // 阅读方向场景, AABB 已经足够精确。
+        float ulX = (float)l, ulY = (float)t;
+        float urX = (float)r, urY = (float)t;
+        float llX = (float)l, llY = (float)b;
+        float lrX = (float)r, lrY = (float)b;
 
         out.push_back(ulX); out.push_back(ulY);
         out.push_back(urX); out.push_back(urY);
@@ -173,6 +159,117 @@ Java_com_example_pdfium_poc_PdfiumCore_nativeGetPageCharQuads(
     jfloatArray result = env->NewFloatArray(out.size());
     env->SetFloatArrayRegion(result, 0, out.size(), out.data());
     return result;
+}
+
+// ---------- Plan 2: Ink round-trip (PDFium native 自家) ----------
+
+// 写 Ink 标注: points = [x0,y0, x1,y1, ...] PDF 坐标 Y 朝上
+// colorArgb = 0xAARRGGBB, strokeWidth in PDF pt
+// 关键: FPDFAnnot_SetBorder 必填线宽, 否则 PDFium 以 0 宽渲染不可见 (DocReaderReplica 实测)
+JNIEXPORT jboolean JNICALL
+Java_com_example_pdfium_poc_PdfiumCore_nativeAddInk(
+        JNIEnv* env, jobject, jlong docPtr, jint pageIndex,
+        jfloatArray jpoints, jint colorArgb, jfloat strokeWidth) {
+    if (!docPtr) return JNI_FALSE;
+    FPDF_DOCUMENT doc = reinterpret_cast<FPDF_DOCUMENT>(docPtr);
+    FPDF_PAGE page = FPDF_LoadPage(doc, pageIndex);
+    if (!page) return JNI_FALSE;
+    FPDF_ANNOTATION annot = FPDFPage_CreateAnnot(page, FPDF_ANNOT_INK);
+    if (!annot) { FPDF_ClosePage(page); return JNI_FALSE; }
+
+    unsigned int A = (static_cast<unsigned int>(colorArgb) >> 24) & 0xFF;
+    unsigned int R = (static_cast<unsigned int>(colorArgb) >> 16) & 0xFF;
+    unsigned int G = (static_cast<unsigned int>(colorArgb) >> 8) & 0xFF;
+    unsigned int B = static_cast<unsigned int>(colorArgb) & 0xFF;
+    FPDFAnnot_SetColor(annot, FPDFANNOT_COLORTYPE_Color, R, G, B, A);
+
+    jsize n = env->GetArrayLength(jpoints);
+    jfloat* pts = env->GetFloatArrayElements(jpoints, nullptr);
+    int pointCount = n / 2;
+    jboolean ok = JNI_FALSE;
+    if (pointCount >= 2) {
+        std::vector<FS_POINTF> fsPts(pointCount);
+        float minX = pts[0], maxX = pts[0];
+        float minY = pts[1], maxY = pts[1];
+        for (int i = 0; i < pointCount; i++) {
+            fsPts[i].x = pts[i * 2];
+            fsPts[i].y = pts[i * 2 + 1];
+            if (pts[i * 2]     < minX) minX = pts[i * 2];
+            if (pts[i * 2]     > maxX) maxX = pts[i * 2];
+            if (pts[i * 2 + 1] < minY) minY = pts[i * 2 + 1];
+            if (pts[i * 2 + 1] > maxY) maxY = pts[i * 2 + 1];
+        }
+        FPDFAnnot_AddInkStroke(annot, fsPts.data(), pointCount);
+
+        float pad = strokeWidth + 2.0f;
+        FS_RECTF rect = { minX - pad, maxY + pad, maxX + pad, minY - pad };
+        FPDFAnnot_SetRect(annot, &rect);
+        FPDFAnnot_SetBorder(annot, 0.0f, 0.0f, strokeWidth);
+        ok = JNI_TRUE;
+    }
+    env->ReleaseFloatArrayElements(jpoints, pts, JNI_ABORT);
+    FPDFPage_CloseAnnot(annot);
+    FPDFPage_GenerateContent(page);
+    FPDF_ClosePage(page);
+    return ok;
+}
+
+// 探测某页所有 annotation 的 subtype 和 ink 数据
+// 返回 String: "annotCount=N,subtype0=X,subtype1=Y,...,inkCount=M,ink0_paths=P"
+JNIEXPORT jstring JNICALL
+Java_com_example_pdfium_poc_PdfiumCore_nativeInspectAnnotations(
+        JNIEnv* env, jobject, jlong docPtr, jint pageIndex) {
+    if (!docPtr) return env->NewStringUTF("error: null doc");
+    FPDF_PAGE page = FPDF_LoadPage(reinterpret_cast<FPDF_DOCUMENT>(docPtr), pageIndex);
+    if (!page) return env->NewStringUTF("error: null page");
+    int n = FPDFPage_GetAnnotCount(page);
+    std::string result = "annotCount=" + std::to_string(n);
+    int inkCount = 0;
+    for (int i = 0; i < n; i++) {
+        FPDF_ANNOTATION annot = FPDFPage_GetAnnot(page, i);
+        if (!annot) continue;
+        int subtype = FPDFAnnot_GetSubtype(annot);
+        result += ",subtype" + std::to_string(i) + "=" + std::to_string(subtype);
+        if (subtype == FPDF_ANNOT_INK) {
+            int pathCount = FPDFAnnot_GetInkListCount(annot);
+            result += ",ink" + std::to_string(inkCount) + "_paths=" + std::to_string(pathCount);
+            for (int pi = 0; pi < pathCount; pi++) {
+                int ptCount = FPDFAnnot_GetInkListPath(annot, pi, nullptr, 0);
+                result += ",ink" + std::to_string(inkCount) + "_path" + std::to_string(pi) + "_pts=" + std::to_string(ptCount);
+            }
+            inkCount++;
+        }
+        FPDFPage_CloseAnnot(annot);
+    }
+    result += ",inkAnnotCount=" + std::to_string(inkCount);
+    FPDF_ClosePage(page);
+    return env->NewStringUTF(result.c_str());
+}
+
+// 用 FPDF_SaveAsCopy 保存到指定路径
+struct FileWriteCtx : FPDF_FILEWRITE {
+    FILE* fp;
+};
+static int WriteBlockCallback(FPDF_FILEWRITE* pThis, const void* data, unsigned long size) {
+    FileWriteCtx* ctx = static_cast<FileWriteCtx*>(pThis);
+    return fwrite(data, 1, size, ctx->fp) == size ? 1 : 0;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_example_pdfium_poc_PdfiumCore_nativeSaveAsCopy(
+        JNIEnv* env, jobject, jlong docPtr, jstring joutPath) {
+    if (!docPtr) return JNI_FALSE;
+    const char* out = env->GetStringUTFChars(joutPath, nullptr);
+    FILE* fp = fopen(out, "wb");
+    env->ReleaseStringUTFChars(joutPath, out);
+    if (!fp) return JNI_FALSE;
+    FileWriteCtx ctx;
+    ctx.version = 1;
+    ctx.WriteBlock = WriteBlockCallback;
+    ctx.fp = fp;
+    FPDF_BOOL ok = FPDF_SaveAsCopy(reinterpret_cast<FPDF_DOCUMENT>(docPtr), &ctx, 0);
+    fclose(fp);
+    return ok ? JNI_TRUE : JNI_FALSE;
 }
 
 }  // extern "C"
